@@ -41,6 +41,26 @@ export const whatsappNumberSchema: JSONSchema7 = {
   },
 };
 
+export const findLidPhonesSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    lids: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 200,
+      uniqueItems: true,
+      items: {
+        type: 'string',
+        pattern: '^\\d+(:\\d+)?@lid$',
+        description: 'Each item in "lids" must be a LID JID like 123456789012345@lid',
+      },
+      description: '"lids" must be a list of 1 to 200 distinct LID JIDs',
+    },
+  },
+  required: ['lids'],
+};
+
 export const readMessageSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

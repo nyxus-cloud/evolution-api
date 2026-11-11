@@ -4,6 +4,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FindLidPhonesDto,
   getBase64FromMediaMessageDto,
   LastMessage,
   MarkChatUnreadDto,
@@ -4173,6 +4174,27 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return onWhatsapp;
+  }
+
+  // Reads only the local lid-mapping store. getLIDForPN and onWhatsApp would query WhatsApp.
+  public async findLidPhones(data: FindLidPhonesDto) {
+    const lidMapping = this.client?.signalRepository?.lidMapping;
+    if (!lidMapping) {
+      throw new BadRequestException('The instance has no WhatsApp session yet. Connect it and try again.');
+    }
+
+    const phones: Record<string, string | null> = {};
+    await Promise.all(
+      data.lids.map(async (lid) => {
+        const pn = await lidMapping.getPNForLID(lid);
+        phones[lid] = pn ? jidNormalizedUser(pn) : null;
+      }),
+    );
+
+    const found = Object.values(phones).filter(Boolean).length;
+    this.logger.info(`findLidPhones: ${found} of ${data.lids.length} LIDs have a phone`);
+
+    return { phones };
   }
 
   public async markMessageAsRead(data: ReadMessageDto) {

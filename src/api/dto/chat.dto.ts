@@ -26,6 +26,10 @@ export class WhatsAppNumberDto {
   numbers: string[];
 }
 
+export class FindLidPhonesDto {
+  lids: string[];
+}
+
 export class NumberDto {
   number: string;
 }

@@ -3,6 +3,7 @@ import {
   BlockUserDto,
   DecryptPollVoteDto,
   DeleteMessage,
+  FindLidPhonesDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   MarkMessageAsPlayedDto,
@@ -26,6 +27,10 @@ export class ChatController {
 
   public async whatsappNumber({ instanceName }: InstanceDto, data: WhatsAppNumberDto) {
     return await this.waMonitor.waInstances[instanceName].whatsappNumber(data);
+  }
+
+  public async findLidPhones({ instanceName }: InstanceDto, data: FindLidPhonesDto) {
+    return await this.waMonitor.waInstances[instanceName].findLidPhones(data);
   }
 
   public async readMessage({ instanceName }: InstanceDto, data: ReadMessageDto) {

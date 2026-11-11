@@ -1,0 +1,109 @@
+diff --git a/node_modules/baileys/lib/Utils/history.js b/node_modules/baileys/lib/Utils/history.js
+index 87222ad..623fafa 100644
+--- a/node_modules/baileys/lib/Utils/history.js
++++ b/node_modules/baileys/lib/Utils/history.js
+@@ -2,10 +2,26 @@ import { promisify } from 'util';
+ import { inflate } from 'zlib';
+ import { proto } from '../../WAProto/index.js';
+ import { WAMessageStubType } from '../Types/index.js';
++import { isHostedLidUser, isHostedPnUser, isLidUser, isPnUser } from '../WABinary/index.js';
+ import { toNumber } from './generics.js';
+ import { normalizeMessageContent } from './messages.js';
+ import { downloadContentFromMessage } from './messages-media.js';
+ const inflatePromise = promisify(inflate);
++const extractPnFromMessages = (messages) => {
++    for (const msgItem of messages) {
++        const message = msgItem.message;
++        // Only extract from outgoing messages (fromMe: true) in 1:1 chats
++        // because userReceipt.userJid is the recipient's JID
++        if (!message?.key?.fromMe || !message.userReceipt?.length) {
++            continue;
++        }
++        const userJid = message.userReceipt[0]?.userJid;
++        if (userJid && (isPnUser(userJid) || isHostedPnUser(userJid))) {
++            return userJid;
++        }
++    }
++    return undefined;
++};
+ export const downloadHistory = async (msg, options) => {
+     const stream = await downloadContentFromMessage(msg, 'md-msg-hist', { options });
+     const bufferArray = [];
+@@ -22,6 +38,14 @@ export const processHistoryMessage = (item) => {
+     const messages = [];
+     const contacts = [];
+     const chats = [];
++    // Extract LID-PN mappings for all sync types
++    const lidPnMappings = [];
++    for (const m of item.phoneNumberToLidMappings || []) {
++        if (m.lidJid && m.pnJid) {
++            lidPnMappings.push({ lid: m.lidJid, pn: m.pnJid });
++        }
++    }
++    const lidPnMappingsFromSyncField = lidPnMappings.length;
+     switch (item.syncType) {
+         case proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP:
+         case proto.HistorySync.HistorySyncType.RECENT:
+@@ -34,6 +58,22 @@ export const processHistoryMessage = (item) => {
+                     lid: chat.lidJid || undefined,
+                     phoneNumber: chat.pnJid || undefined
+                 });
++                const chatId = chat.id;
++                const isLid = isLidUser(chatId) || isHostedLidUser(chatId);
++                const isPn = isPnUser(chatId) || isHostedPnUser(chatId);
++                if (isLid && chat.pnJid) {
++                    lidPnMappings.push({ lid: chatId, pn: chat.pnJid });
++                }
++                else if (isPn && chat.lidJid) {
++                    lidPnMappings.push({ lid: chat.lidJid, pn: chatId });
++                }
++                else if (isLid && !chat.pnJid) {
++                    // Fallback: extract PN from userReceipt in messages when pnJid is missing
++                    const pnFromReceipt = extractPnFromMessages(chat.messages || []);
++                    if (pnFromReceipt) {
++                        lidPnMappings.push({ lid: chatId, pn: pnFromReceipt });
++                    }
++                }
+                 const msgs = chat.messages || [];
+                 delete chat.messages;
+                 for (const item of msgs) {
+@@ -68,6 +108,8 @@ export const processHistoryMessage = (item) => {
+         chats,
+         contacts,
+         messages,
++        lidPnMappings,
++        lidPnMappingsFromSyncField,
+         syncType: item.syncType,
+         progress: item.progress
+     };
+diff --git a/node_modules/baileys/lib/Utils/process-message.js b/node_modules/baileys/lib/Utils/process-message.js
+index 7927483..5de1506 100644
+--- a/node_modules/baileys/lib/Utils/process-message.js
++++ b/node_modules/baileys/lib/Utils/process-message.js
+@@ -1,7 +1,7 @@
+ import { proto } from '../../WAProto/index.js';
+ import { WAMessageStubType } from '../Types/index.js';
+ import { getContentType, normalizeMessageContent } from '../Utils/messages.js';
+-import { areJidsSameUser, isHostedLidUser, isHostedPnUser, isJidBroadcast, isJidStatusBroadcast, isLidUser, jidDecode, jidEncode, jidNormalizedUser } from '../WABinary/index.js';
++import { areJidsSameUser, isHostedLidUser, isHostedPnUser, isJidBroadcast, isJidStatusBroadcast, isLidUser, isPnUser, jidDecode, jidEncode, jidNormalizedUser } from '../WABinary/index.js';
+ import { aesDecryptGCM, hmacSign } from './crypto.js';
+ import { getKeyAuthor, toNumber } from './generics.js';
+ import { downloadAndProcessHistorySyncNotification } from './history.js';
+@@ -167,7 +167,16 @@ const processMessage = async (message, { shouldProcessHistoryMsg, placeholderRes
+                             ]
+                         });
+                     }
+-                    const data = await downloadAndProcessHistorySyncNotification(histNotification, options);
++                    const { lidPnMappingsFromSyncField, ...data } = await downloadAndProcessHistorySyncNotification(histNotification, options);
++                    if (data.lidPnMappings?.length) {
++                        logger?.debug({ count: data.lidPnMappings.length }, 'processing LID-PN mappings from history sync');
++                        // Nyxus: rc.9's store logs every pair it rejects, so only hand it pairs it accepts.
++                        const pairs = data.lidPnMappings.filter(({ lid, pn }) => isLidUser(lid) && isPnUser(pn));
++                        await signalRepository.lidMapping
++                            .storeLIDPNMappings(pairs)
++                            .then(() => console.log(`[nyxus] lid-pn mappings from history sync (type ${histNotification.syncType}): ${lidPnMappingsFromSyncField} from phoneNumberToLidMappings, ${data.lidPnMappings.length - lidPnMappingsFromSyncField} from conversations, ${pairs.length} valid pairs stored`))
++                            .catch(err => console.log(`[nyxus] failed to store ${pairs.length} lid-pn mappings from history sync: ${err?.code || err?.name}`));
++                    }
+                     ev.emit('messaging-history.set', {
+                         ...data,
+                         isLatest: histNotification.syncType !== proto.HistorySync.HistorySyncType.ON_DEMAND ? isLatest : undefined,

@@ -4,6 +4,7 @@ import {
   BlockUserDto,
   DecryptPollVoteDto,
   DeleteMessage,
+  FindLidPhonesDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   MarkMessageAsPlayedDto,
@@ -27,6 +28,7 @@ import {
   contactValidateSchema,
   decryptPollVoteSchema,
   deleteMessageSchema,
+  findLidPhonesSchema,
   markChatUnreadSchema,
   markMessageAsPlayedSchema,
   messageUpSchema,
@@ -63,6 +65,16 @@ export class ChatRouter extends RouterBroker {
           console.log(error);
           return res.status(HttpStatus.BAD_REQUEST).json(error);
         }
+      })
+      .post(this.routerPath('findLidPhones'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<FindLidPhonesDto>({
+          request: req,
+          schema: findLidPhonesSchema,
+          ClassRef: FindLidPhonesDto,
+          execute: (instance, data) => chatController.findLidPhones(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
       })
       .post(this.routerPath('markMessageAsRead'), ...guards, async (req, res) => {
         const response = await this.dataValidate<ReadMessageDto>({
