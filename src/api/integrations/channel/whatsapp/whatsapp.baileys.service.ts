@@ -60,6 +60,7 @@ import {
 import {
   countReason,
   CountsByReason,
+  describePersistError,
   insertManyResilient,
   missingMessageColumns,
   topLevelMessageKeys,
@@ -875,8 +876,17 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CHATS_UPSERT, chatsToInsert);
 
       if (chatsToInsert.length > 0) {
-        if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS)
-          await this.prismaRepository.chat.createMany({ data: chatsToInsert, skipDuplicates: true });
+        if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
+          const result = await insertManyResilient(chatsToInsert, (data) =>
+            this.prismaRepository.chat.createMany({ data, skipDuplicates: true }),
+          );
+
+          if (result.failed > 0) {
+            this.logger.warn(
+              `chats.upsert: ${result.failed} of ${chatsToInsert.length} chats not saved: ${JSON.stringify(result.reasons)}`,
+            );
+          }
+        }
       }
     },
 
@@ -924,8 +934,17 @@ export class BaileysStartupService extends ChannelStartupService {
         if (contactsRaw.length > 0) {
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+            const result = await insertManyResilient<any>(contactsRaw, (data) =>
+              this.prismaRepository.contact.createMany({ data, skipDuplicates: true }),
+            );
+
+            if (result.failed > 0) {
+              this.logger.warn(
+                `contacts.upsert: ${result.failed} of ${contactsRaw.length} contacts not saved: ${JSON.stringify(result.reasons)}`,
+              );
+            }
+          }
 
           const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
           if (usersContacts) {
@@ -1015,14 +1034,23 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
 
       if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-        const updateTransactions = contactsRaw.map((contact) =>
-          this.prismaRepository.contact.upsert({
-            where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
-            create: contact,
-            update: contact,
-          }),
+        const result = await insertManyResilient(contactsRaw, (rows) =>
+          this.prismaRepository.$transaction(
+            rows.map((contact) =>
+              this.prismaRepository.contact.upsert({
+                where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
+                create: contact,
+                update: contact,
+              }),
+            ),
+          ),
         );
-        await this.prismaRepository.$transaction(updateTransactions);
+
+        if (result.failed > 0) {
+          this.logger.warn(
+            `contacts.update: ${result.failed} of ${contactsRaw.length} contacts not saved: ${JSON.stringify(result.reasons)}`,
+          );
+        }
       }
 
       //const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
@@ -1568,7 +1596,25 @@ export class BaileysStartupService extends ChannelStartupService {
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { pollUpdates, ...messageData } = messageRaw as any;
-            const msg = await this.prismaRepository.message.create({ data: messageData });
+            const missingColumns = missingMessageColumns(messageData);
+
+            if (missingColumns.length > 0) {
+              this.logger.warn(
+                `messages.upsert: message not saved, ${missingColumns.join(',')} missing [${topLevelMessageKeys(received.message)}]`,
+              );
+              continue;
+            }
+
+            let msg: Message;
+
+            try {
+              msg = await this.prismaRepository.message.create({ data: messageData });
+            } catch (error) {
+              this.logger.warn(
+                `messages.upsert: message not saved, ${describePersistError(error)} [${topLevelMessageKeys(received.message)}]`,
+              );
+              continue;
+            }
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
