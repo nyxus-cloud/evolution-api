@@ -57,6 +57,13 @@ import {
   StatusMessage,
   TypeButton,
 } from '@api/dto/sendMessage.dto';
+import {
+  countReason,
+  CountsByReason,
+  insertManyResilient,
+  missingMessageColumns,
+  topLevelMessageKeys,
+} from '@api/integrations/channel/whatsapp/helpers/messagePersistence.helper';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
@@ -1140,7 +1147,15 @@ export class BaileysStartupService extends ChannelStartupService {
             return chat;
           });
 
-          await this.prismaRepository.chat.createMany({ data: chatsToCreateMany, skipDuplicates: true });
+          const chatsResult = await insertManyResilient<any>(chatsToCreateMany, (data) =>
+            this.prismaRepository.chat.createMany({ data, skipDuplicates: true }),
+          );
+
+          if (chatsResult.failed > 0) {
+            this.logger.warn(
+              `History sync: ${chatsResult.failed} of ${chatsToCreateMany.length} chats not saved: ${JSON.stringify(chatsResult.reasons)}`,
+            );
+          }
         }
 
         this.historySyncChatCount += chatsRaw.length;
@@ -1166,6 +1181,8 @@ export class BaileysStartupService extends ChannelStartupService {
         if (chatwootImport.getRepositoryMessagesCache(instance) === null) {
           chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
         }
+
+        const skippedMessages: CountsByReason = {};
 
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
@@ -1195,13 +1212,37 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          messagesRaw.push(this.prepareMessage(m));
+          const messageRaw = this.prepareMessage(m);
+          const missingColumns = missingMessageColumns(messageRaw);
+
+          if (missingColumns.length > 0) {
+            countReason(skippedMessages, `${missingColumns.join(',')} missing [${topLevelMessageKeys(m.message)}]`);
+            continue;
+          }
+
+          messagesRaw.push(messageRaw);
+        }
+
+        const skippedCount = Object.values(skippedMessages).reduce((total, count) => total + count, 0);
+
+        if (skippedCount > 0) {
+          this.logger.warn(
+            `History sync: skipped ${skippedCount} of ${messages.length} messages that cannot be stored: ${JSON.stringify(skippedMessages)}`,
+          );
         }
 
         this.historySyncMessageCount += messagesRaw.length;
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          const messagesResult = await insertManyResilient(messagesRaw, (data) =>
+            this.prismaRepository.message.createMany({ data, skipDuplicates: true }),
+          );
+
+          if (messagesResult.failed > 0) {
+            this.logger.warn(
+              `History sync: ${messagesResult.failed} of ${messagesRaw.length} messages not saved: ${JSON.stringify(messagesResult.reasons)}`,
+            );
+          }
         }
 
         this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
