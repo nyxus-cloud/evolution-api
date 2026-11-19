@@ -402,7 +402,7 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>, source?: WASocket) {
     // Enhanced logging for connection updates
     const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
     this.logger.info({
@@ -414,6 +414,15 @@ export class BaileysStartupService extends ChannelStartupService {
       isDeleting: this.isDeleting,
       endSession: this.endSession,
     });
+
+    if (source && source !== this.client) {
+      if (connection === 'close') {
+        this.logger.info(
+          `Reconnect decision: instance=${this.instance.name} code=${statusCode ?? 'none'} action=ignore (socket already replaced)`,
+        );
+      }
+      return;
+    }
 
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
@@ -816,6 +825,13 @@ export class BaileysStartupService extends ChannelStartupService {
     };
 
     this.endSession = false;
+
+    // Two sockets on the same credentials replace each other (440); connectionUpdate ignores the old one's close.
+    try {
+      this.client?.end(new Error('Socket replaced by a new connection'));
+    } catch {
+      // already closed
+    }
 
     this.client = makeWASocket(socketConfig);
 
@@ -2239,7 +2255,8 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
-    this.client.ev.process(async (events) => {
+    const client = this.client;
+    client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
           if (!this.endSession) {
@@ -2266,7 +2283,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              this.connectionUpdate(events['connection.update'], client);
             }
 
             if (events['creds.update']) {
