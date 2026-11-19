@@ -65,6 +65,13 @@ import {
   missingMessageColumns,
   topLevelMessageKeys,
 } from '@api/integrations/channel/whatsapp/helpers/messagePersistence.helper';
+import {
+  backoffDelayMs,
+  CONNECTION_REPLACED_CODE,
+  decideReconnect,
+  ReconnectDecision,
+  wasStableOpen,
+} from '@api/integrations/channel/whatsapp/helpers/reconnectPolicy.helper';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
@@ -271,6 +278,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private isDeleting = false; // Flag to prevent reconnection during deletion
+  private reconnectAttempt = 0;
+  private replacedCount = 0;
+  private openedAt: number | null = null;
+  private reconnectTimer: NodeJS.Timeout | null = null;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
@@ -296,6 +307,7 @@ export class BaileysStartupService extends ChannelStartupService {
     // Mark instance as deleting to prevent reconnection attempts.
     this.isDeleting = true;
     this.endSession = true;
+    this.clearReconnectTimer();
 
     this.messageProcessor.onDestroy();
 
@@ -502,71 +514,73 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      // 408 = request timeout — added per #2501 to avoid reconnect loops on
-      // transient network drops where the server returned a 408 in the close.
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406, 408];
+      const paired = !!this.instance.authState?.state?.creds?.me?.id;
+      // Unpaired and no QR code yet: reconnecting here would loop before the QR code is generated.
+      const initialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
 
-      // FIX: Do not reconnect if it's the initial connection (waiting for QR code)
-      // This prevents infinite loop that blocks QR code generation
-      const isInitialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
+      if (wasStableOpen(this.openedAt, Date.now())) {
+        this.reconnectAttempt = 0;
+        this.replacedCount = 0;
+      }
+      this.openedAt = null;
+      if (paired && statusCode === CONNECTION_REPLACED_CODE) this.replacedCount++;
 
-      if (isInitialConnection) {
-        this.logger.info('Initial connection closed, waiting for QR code generation...');
+      const decision = decideReconnect({
+        statusCode,
+        paired,
+        initialConnection,
+        attempt: this.reconnectAttempt,
+        replacedCount: this.replacedCount,
+      });
+
+      this.logReconnectDecision(statusCode, paired, decision);
+
+      if (decision.action === 'wait') return;
+
+      if (decision.action === 'reconnect') {
+        if (paired) {
+          this.reconnectAttempt++;
+          this.stateConnection = { state: 'connecting', statusReason: statusCode };
+        }
+        this.scheduleReconnect(decision.delayMs);
         return;
       }
 
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
-
-      this.logger.info({
-        message: 'Connection closed, evaluating reconnection',
-        statusCode,
-        shouldReconnect,
-        instanceName: this.instance.name,
+      this.sendDataWebhook(Events.STATUS_INSTANCE, {
+        instance: this.instance.name,
+        status: 'closed',
+        disconnectionAt: new Date(),
+        disconnectionReasonCode: statusCode,
+        disconnectionObject: JSON.stringify(lastDisconnect),
       });
 
-      if (shouldReconnect) {
-        // Add 3 second delay before reconnection to prevent rapid reconnection loops
-        this.logger.info('Reconnecting in 3 seconds...');
-        setTimeout(async () => {
-          await this.connectToWhatsapp(this.phoneNumber);
-        }, 3000);
-      } else {
-        this.logger.info(`Skipping reconnection for status code ${statusCode} (code is in codesToNotReconnect list)`);
-        this.sendDataWebhook(Events.STATUS_INSTANCE, {
-          instance: this.instance.name,
-          status: 'closed',
+      await this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: {
+          connectionStatus: 'close',
           disconnectionAt: new Date(),
           disconnectionReasonCode: statusCode,
           disconnectionObject: JSON.stringify(lastDisconnect),
-        });
+        },
+      });
 
-        await this.prismaRepository.instance.update({
-          where: { id: this.instanceId },
-          data: {
-            connectionStatus: 'close',
-            disconnectionAt: new Date(),
-            disconnectionReasonCode: statusCode,
-            disconnectionObject: JSON.stringify(lastDisconnect),
-          },
-        });
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
-            Events.STATUS_INSTANCE,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            { instance: this.instance.name, status: 'closed' },
-          );
-        }
-
-        this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
-        this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
-
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+        this.chatwootService.eventWhatsapp(
+          Events.STATUS_INSTANCE,
+          { instanceName: this.instance.name, instanceId: this.instanceId },
+          { instance: this.instance.name, status: 'closed' },
+        );
       }
+
+      if (decision.action === 'logout') this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+      this.client?.ws?.close();
+      this.client.end(new Error('Close connection'));
+
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
     }
 
     if (connection === 'open') {
+      this.openedAt = Date.now();
       if (!this.client?.user?.id) {
         this.logger.warn('connectionUpdate: connection open but client.user is undefined, skipping');
         return;
@@ -695,6 +709,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async createClient(number?: string): Promise<WASocket> {
+    this.clearReconnectTimer();
     this.instance.authState = await this.defineAuthState();
 
     if (number) {
@@ -828,6 +843,13 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    this.reconnectAttempt = 0;
+    this.replacedCount = 0;
+
+    return this.startClient(number);
+  }
+
+  private async startClient(number?: string): Promise<WASocket> {
     try {
       this.loadChatwoot();
       this.loadSettings();
@@ -844,6 +866,46 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
     }
+  }
+
+  private scheduleReconnect(delayMs: number) {
+    this.clearReconnectTimer();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.isDeleting || this.endSession) return;
+
+      this.startClient(this.phoneNumber).catch(() => {
+        if (!this.instance.authState?.state?.creds?.me?.id) return;
+
+        const nextDelayMs = backoffDelayMs(this.reconnectAttempt);
+        this.reconnectAttempt++;
+        this.logger.warn(
+          `Reconnect failed to start: instance=${this.instance.name} attempt=${this.reconnectAttempt} nextDelayMs=${nextDelayMs}`,
+        );
+        this.scheduleReconnect(nextDelayMs);
+      });
+    }, delayMs);
+  }
+
+  private clearReconnectTimer() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+  }
+
+  private logReconnectDecision(statusCode: number | undefined, paired: boolean, decision: ReconnectDecision) {
+    const fields = [
+      `instance=${this.instance.name}`,
+      `code=${statusCode ?? 'none'}`,
+      `paired=${paired}`,
+      `action=${decision.action}`,
+      `attempt=${this.reconnectAttempt + (paired && decision.action === 'reconnect' ? 1 : 0)}`,
+    ];
+    if (statusCode === CONNECTION_REPLACED_CODE) fields.push(`replaced=${this.replacedCount}`);
+    if (decision.action === 'reconnect') fields.push(`nextDelayMs=${decision.delayMs}`);
+
+    const line = `Reconnect decision: ${fields.join(' ')}`;
+    if (decision.action === 'stop' || decision.action === 'logout') this.logger.warn(line);
+    else this.logger.info(line);
   }
 
   public async reloadConnection(): Promise<WASocket> {
