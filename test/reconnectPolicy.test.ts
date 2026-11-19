@@ -4,6 +4,7 @@ import { describe, test } from 'node:test';
 import {
   backoffDelayMs,
   decideReconnect,
+  isPaired,
   RECONNECT_POLICY,
   ReconnectInput,
   wasStableOpen,
@@ -28,6 +29,16 @@ const unpaired = (statusCode: number | undefined, extra: Partial<ReconnectInput>
   attempt: 0,
   replacedCount: 0,
   ...extra,
+});
+
+describe('paired', () => {
+  test('only after pair-success wrote the account', () => {
+    assert.equal(isPaired(undefined), false);
+    assert.equal(isPaired({}), false);
+    assert.equal(isPaired({ me: { id: '5511999999999@s.whatsapp.net' } }), false, 'requestPairingCode sets me first');
+    assert.equal(isPaired({ account: {} }), false);
+    assert.equal(isPaired({ me: { id: '5511999999999:12@s.whatsapp.net' }, account: { details: 'x' } }), true);
+  });
 });
 
 describe('QR/pairing phase (unpaired) keeps the upstream behaviour', () => {

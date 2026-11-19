@@ -22,9 +22,17 @@ export const CONNECTION_REPLACED_CODE = 440;
 /** QR/pairing phase codes that end the attempt (408: the QR codes ran out). Unchanged from upstream. */
 export const QR_PHASE_END_CODES: readonly number[] = [401, 402, 403, 406, 408];
 
+/**
+ * Whether the device finished pairing. `creds.account` is only written by pair-success (QR code and pairing code);
+ * `creds.me` alone is not enough because `requestPairingCode` sets it before the phone confirms.
+ */
+export function isPaired(creds: { me?: { id?: string } | null; account?: unknown } | null | undefined): boolean {
+  return !!creds?.me?.id && !!creds?.account;
+}
+
 export type ReconnectInput = {
   statusCode: number | undefined;
-  /** The auth state has `creds.me`: the device finished pairing, so Baileys logs in instead of showing a QR code. */
+  /** See `isPaired`. Unpaired instances are in the QR/pairing phase. */
   paired: boolean;
   /** Unpaired and no QR code shown yet. */
   initialConnection: boolean;

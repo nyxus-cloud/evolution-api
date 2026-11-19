@@ -69,6 +69,7 @@ import {
   backoffDelayMs,
   CONNECTION_REPLACED_CODE,
   decideReconnect,
+  isPaired,
   ReconnectDecision,
   wasStableOpen,
 } from '@api/integrations/channel/whatsapp/helpers/reconnectPolicy.helper';
@@ -523,7 +524,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const paired = !!this.instance.authState?.state?.creds?.me?.id;
+      const paired = isPaired(this.instance.authState?.state?.creds);
       // Unpaired and no QR code yet: reconnecting here would loop before the QR code is generated.
       const initialConnection = !this.instance.wuid && (this.instance.qrcode?.count ?? 0) === 0;
 
@@ -891,7 +892,7 @@ export class BaileysStartupService extends ChannelStartupService {
       if (this.isDeleting || this.endSession) return;
 
       this.startClient(this.phoneNumber).catch(() => {
-        if (!this.instance.authState?.state?.creds?.me?.id) return;
+        if (!isPaired(this.instance.authState?.state?.creds)) return;
 
         const nextDelayMs = backoffDelayMs(this.reconnectAttempt);
         this.reconnectAttempt++;
