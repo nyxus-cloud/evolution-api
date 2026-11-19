@@ -11,6 +11,7 @@ Branch `nyxus/2.4.0-rc2` is the `2.4.0-rc2` tag plus:
 | `fix(security): keep the body name on instance create` | follow-up to the fix above | `release/2.3.8` |
 | `feat(chat): keep history LID-phone pairs and look them up` | Baileys rc.9 drops the LID ↔ phone pairs of the history sync, so chats with non-contacts stay LID-only. See below | Baileys PRs #2268, #2282, #2316 (in `7.0.0-rc10`) |
 | `fix(whatsapp): keep a history batch when some messages cannot be stored` and `fix(whatsapp): one bad row no longer drops other messages, chats or contacts` | One `messageHistoryNotice` (no `messageType`) made `createMany` reject and lose a whole history batch. See below | none yet |
+| `fix(whatsapp): reconnect a paired number on 408 and transient closes with backoff` and `fix(whatsapp): a replaced socket no longer starts another reconnect` | A 408 under load logged out paired numbers and removed their session; a 440 reconnected every ~3.5 s for hours. See below | none yet |
 
 ## LID ↔ phone pairs (`2.4.0-rc2-nyxus.2`)
 
@@ -23,6 +24,28 @@ Branch `nyxus/2.4.0-rc2` is the `2.4.0-rc2` tag plus:
 - Messages whose type `getContentType` cannot tell (`messageHistoryNotice`, `messageHistoryBundle`, `callLogMesssage`, `messageContextInfo`/`senderKeyDistributionMessage` only) or that miss another required `Message` column are not stored; history logs one line per batch: `History sync: skipped N of M messages that cannot be stored: {"messageType missing [messageContextInfo+messageHistoryNotice]": N}`.
 - A failed bulk insert (history messages and chats, `chats.upsert`, `contacts.upsert`, `contacts.update`) is retried in chunks of 500 and then row by row; only the failing rows are lost, logged as `... N of M ... not saved: {"<error class> <code> (<field>)": N}`, never content. In `messages.upsert` a failed insert skips only that message.
 - `npx tsx --test test/messagePersistence.test.ts`; set `TEST_DATABASE_CONNECTION_URI` to a throwaway Postgres to run the database cases.
+
+## Reconnection (`2.4.0-rc2-nyxus.4`)
+
+Paired means pair-success wrote `creds.me` and `creds.account` (`isPaired`); a pairing-code instance gets `creds.me` before the phone confirms, so it stays in the QR/pairing phase until then. The decision is `decideReconnect` in `helpers/reconnectPolicy.helper.ts`.
+
+| Code | Baileys | Unpaired (QR/pairing phase, as upstream) | Paired |
+| --- | --- | --- | --- |
+| any, first close before a QR code | | wait for the QR code | (not used) |
+| 401 | `loggedOut` | end the attempt | log out: credentials removed |
+| 402 | connection failure: temporary ban | end the attempt | stop: closed, credentials kept |
+| 403 | `forbidden` (main device gone) | end the attempt | log out: credentials removed |
+| 406 | connection failure: unknown logout | end the attempt | log out: credentials removed |
+| 408 | `connectionLost` / `timedOut` (also "QR refs attempts ended") | end the attempt (no QR loop) | reconnect with backoff |
+| 440 | `connectionReplaced` (`stream:error conflict`) | reconnect after 3 s | reconnect with backoff; the 5th replacement without a stable open stops: closed, credentials kept |
+| 411, 428, 500, 503, 515, none, other | `multideviceMismatch`, `connectionClosed`, `badSession`, `unavailableService`, `restartRequired` | reconnect after 3 s | reconnect with backoff |
+
+- Backoff: 2 s doubling to 60 s, minus up to 20% jitter, with no attempt limit. An open that lasts 3 minutes, or a manual `/instance/connect`, resets the attempts and the 440 count. While a reconnect is scheduled the instance state reads `connecting`.
+- Log out: as upstream, `STATUS_INSTANCE` closed, `connectionStatus: close`, `logout.instance` (session removed, `LOGOUT_INSTANCE` webhook), `CONNECTION_UPDATE` close with the code. Stop: the same without `logout.instance`, so `/instance/connect` reconnects with the stored session; the instance is not auto-connected on the next restart.
+- A paired instance whose first connection after a restart closes now reconnects (upstream left it closed: `!wuid && qrcode.count === 0`).
+- A new socket ends the previous one, and updates from a replaced socket are ignored, so two sockets on the same credentials cannot replace each other forever.
+- One line per decision, no content: `Reconnect decision: instance=<name> code=<code> paired=<bool> action=<reconnect|stop|logout|wait|ignore> attempt=<n> [replaced=<n>] [nextDelayMs=<ms>]`.
+- `npx tsx --test test/reconnectPolicy.test.ts`.
 
 The upstream workflows are removed on this branch. `nyxus-image.yml` builds `ghcr.io/nyxus-cloud/evolution-api` when a tag like `2.4.0-rc2-nyxus.1` is pushed. The `version` in `package.json` (shown by `GET /`) carries the same `-nyxus.<n>` suffix.
 
